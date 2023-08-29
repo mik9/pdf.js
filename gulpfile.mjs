@@ -1120,6 +1120,7 @@ function buildMinified(defines, dir) {
   rimraf.sync(dir);
 
   return merge([
+    createComponentsBundle(defines).pipe(gulp.dest(dir)),
     createMainBundle(defines).pipe(gulp.dest(dir + "build")),
     createWorkerBundle(defines).pipe(gulp.dest(dir + "build")),
     createSandboxBundle(defines).pipe(gulp.dest(dir + "build")),
@@ -1164,6 +1165,9 @@ async function parseMinified(dir) {
   const pdfImageDecodersFile = fs
     .readFileSync(dir + "/image_decoders/pdf.image_decoders.js")
     .toString();
+  const pdfViewerFile = fs
+    .readFileSync(dir + "/pdf_viewer.js")
+    .toString();
   const viewerFiles = {
     "pdf.js": pdfFile,
     "viewer.js": fs.readFileSync(dir + "/web/viewer.js").toString(),
@@ -1202,6 +1206,10 @@ async function parseMinified(dir) {
     dir + "image_decoders/pdf.image_decoders.min.js",
     (await minify(pdfImageDecodersFile, options)).code
   );
+  fs.writeFileSync(
+    dir + "/build/pdf_viewer.min.js",
+    (await minify(pdfViewerFile, options)).code
+  );
 
   console.log();
   console.log("### Cleaning js files");
@@ -1211,6 +1219,7 @@ async function parseMinified(dir) {
   fs.unlinkSync(dir + "/build/pdf.js");
   fs.unlinkSync(dir + "/build/pdf.worker.js");
   fs.unlinkSync(dir + "/build/pdf.sandbox.js");
+  fs.unlinkSync(dir + "/pdf_viewer.js");
 
   fs.renameSync(dir + "/build/pdf.min.js", dir + "/build/pdf.js");
   fs.renameSync(dir + "/build/pdf.worker.min.js", dir + "/build/pdf.worker.js");
