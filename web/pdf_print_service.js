@@ -13,16 +13,16 @@
  * limitations under the License.
  */
 
-// eslint-disable-next-line max-len
-/** @typedef {import("./interfaces.js").IPDFPrintServiceFactory} IPDFPrintServiceFactory */
-
 import {
   AnnotationMode,
   PixelsPerInch,
   RenderingCancelledException,
   shadow,
 } from "pdfjs-lib";
-import { getXfaHtmlForPrinting } from "./print_utils.js";
+import {
+  BasePrintServiceFactory,
+  getXfaHtmlForPrinting,
+} from "./print_utils.js";
 
 let activeService = null;
 let dialog = null;
@@ -58,7 +58,7 @@ function renderPage(
     printAnnotationStoragePromise,
   ]).then(function ([pdfPage, printAnnotationStorage]) {
     const renderContext = {
-      canvasContext: ctx,
+      canvas: scratchCanvas,
       transform: [PRINT_UNITS, 0, 0, PRINT_UNITS, 0, 0],
       viewport: pdfPage.getViewport({ scale: 1, rotation: size.rotation }),
       intent: "print",
@@ -256,6 +256,10 @@ window.print = function () {
     dispatchEvent("beforeprint");
   } finally {
     if (!activeService) {
+      if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("TESTING")) {
+        // eslint-disable-next-line no-unsafe-finally
+        throw new Error("window.print() is not supported");
+      }
       console.error("Expected print service to be initialized.");
       ensureOverlay().then(function () {
         overlayManager.closeIfActive(dialog);
@@ -367,10 +371,7 @@ function ensureOverlay() {
   return overlayPromise;
 }
 
-/**
- * @implements {IPDFPrintServiceFactory}
- */
-class PDFPrintServiceFactory {
+class PDFPrintServiceFactory extends BasePrintServiceFactory {
   static initGlobals(app) {
     viewerApp = app;
   }

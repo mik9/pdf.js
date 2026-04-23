@@ -57,10 +57,10 @@ import {
 } from "./standard_fonts.js";
 import { IdentityToUnicodeMap, ToUnicodeMap } from "./to_unicode_map.js";
 import { CFFFont } from "./cff_font.js";
+import { compileFontInfo } from "./obj_bin_transform_core.js";
 import { FontRendererFactory } from "./font_renderer.js";
 import { getFontBasicMetrics } from "./metrics.js";
 import { GlyfTable } from "./glyf.js";
-import { IdentityCMap } from "./cmap.js";
 import { OpenTypeFileBuilder } from "./opentype_file_builder.js";
 import { readUint32 } from "./core_utils.js";
 import { Stream } from "./stream.js";
@@ -81,7 +81,7 @@ const EXPORT_DATA_PROPERTIES = [
   "bbox",
   "black",
   "bold",
-  "charProcOperatorList",
+  // "charProcOperatorList" is handled separately, since it's not compiled.
   "cssFontInfo",
   "data",
   "defaultVMetrics",
@@ -970,6 +970,12 @@ function createNameTable(name, proto) {
  * decoding logics whatever type it is (assuming the font type is supported).
  */
 class Font {
+  #charsCache = new Map();
+
+  #glyphCache = new Map();
+
+  charProcOperatorList;
+
   constructor(name, file, properties, evaluatorOptions) {
     this.name = name;
     this.psName = null;
@@ -982,17 +988,18 @@ class Font {
     this.missingFile = false;
     this.cssFontInfo = properties.cssFontInfo;
 
-    this._charsCache = Object.create(null);
-    this._glyphCache = Object.create(null);
-
     let isSerifFont = !!(properties.flags & FontFlags.Serif);
     // Fallback to checking the font name, in order to improve text-selection,
     // since the /Flags-entry is often wrong (fixes issue13845.pdf).
     if (!isSerifFont && !properties.isSimulatedFlags) {
-      const baseName = name.replaceAll(/[,_]/g, "-").split("-", 1)[0],
+      const stdFontMap = getStdFontMap(),
+        nonStdFontMap = getNonStdFontMap(),
         serifFonts = getSerifFonts();
-      for (const namePart of baseName.split("+")) {
-        if (serifFonts[namePart]) {
+      for (const namePart of name.split("+")) {
+        let fontName = normalizeFontName(namePart);
+        fontName = stdFontMap[fontName] || nonStdFontMap[fontName] || fontName;
+        fontName = fontName.split("-", 1)[0];
+        if (serifFonts[fontName]) {
           isSerifFont = true;
           break;
         }
@@ -1143,13 +1150,9 @@ class Font {
     return shadow(this, "renderer", renderer);
   }
 
-  exportData() {
-    const exportDataProps = this.fontExtraProperties
-      ? [...EXPORT_DATA_PROPERTIES, ...EXPORT_DATA_EXTRA_PROPERTIES]
-      : EXPORT_DATA_PROPERTIES;
-
+  #getExportData(props) {
     const data = Object.create(null);
-    for (const prop of exportDataProps) {
+    for (const prop of props) {
       const value = this[prop];
       // Ignore properties that haven't been explicitly set.
       if (value !== undefined) {
@@ -1157,6 +1160,16 @@ class Font {
       }
     }
     return data;
+  }
+
+  exportData() {
+    return {
+      buffer: compileFontInfo(this.#getExportData(EXPORT_DATA_PROPERTIES)),
+      charProcOperatorList: this.charProcOperatorList,
+      extra: this.fontExtraProperties
+        ? this.#getExportData(EXPORT_DATA_EXTRA_PROPERTIES)
+        : undefined,
+    };
   }
 
   fallbackToSystemFont(properties) {
@@ -2244,15 +2257,11 @@ class Font {
           if (!valid) {
             break;
           }
-          const customNames = [],
-            strBuf = [];
+          const customNames = [];
           while (font.pos < end) {
-            const stringLength = font.getByte();
-            strBuf.length = stringLength;
-            for (i = 0; i < stringLength; ++i) {
-              strBuf[i] = String.fromCharCode(font.getByte());
-            }
-            customNames.push(strBuf.join(""));
+            const strLen = font.getByte(),
+              str = font.getString(strLen);
+            customNames.push(str);
           }
           glyphNames = [];
           for (i = 0; i < numGlyphs; ++i) {
@@ -2506,7 +2515,7 @@ class Font {
             }
           }
         }
-        // Adjusting stack not extactly, but just enough to get function id
+        // Adjusting stack not exactly, but just enough to get function id
         if (!inFDEF && !inELSE) {
           let stackDelta = 0;
           if (op <= 0x8e) {
@@ -2626,27 +2635,23 @@ class Font {
       header = readOpenTypeHeader(font);
       tables = readTables(font, header.numTables);
     }
-    let cff, cffFile;
 
     const isTrueType = !tables["CFF "];
     if (!isTrueType) {
-      const isComposite =
-        properties.composite &&
-        (properties.cidToGidMap?.length > 0 ||
-          !(properties.cMap instanceof IdentityCMap));
       // OpenType font (skip composite fonts with non-default glyph mapping).
       if (
-        (header.version === "OTTO" && !isComposite) ||
+        (header.version === "OTTO" && !properties.composite) ||
         !tables.head ||
         !tables.hhea ||
         !tables.maxp ||
         !tables.post
       ) {
         // No major tables: throwing everything at `CFFFont`.
-        cffFile = new Stream(tables["CFF "].data);
-        cff = new CFFFont(cffFile, properties);
-
-        return this.convert(name, cff, properties);
+        return this.convert(
+          name,
+          new CFFFont(new Stream(tables["CFF "].data), properties),
+          properties
+        );
       }
 
       delete tables.glyf;
@@ -2674,9 +2679,32 @@ class Font {
       throw new FormatError('Required "maxp" table is not found');
     }
 
+    let numGlyphsFromCFF;
+    if (!isTrueType) {
+      try {
+        // Trying to repair CFF file
+        const parser = new CFFParser(
+          new Stream(tables["CFF "].data),
+          properties,
+          SEAC_ANALYSIS_ENABLED
+        );
+        const cff = parser.parse();
+        cff.duplicateFirstGlyph();
+        const compiler = new CFFCompiler(cff);
+        tables["CFF "].data = compiler.compile();
+        numGlyphsFromCFF = cff.charStringCount;
+      } catch {
+        warn("Failed to compile font " + properties.loadedName);
+      }
+    }
+
     font.pos = (font.start || 0) + tables.maxp.offset;
     let version = font.getInt32();
-    const numGlyphs = font.getUint16();
+    const numGlyphs = numGlyphsFromCFF ?? font.getUint16();
+    if (version === 0x00005000 && tables.maxp.length !== 6) {
+      tables.maxp.data = tables.maxp.data.subarray(0, 6);
+      tables.maxp.length = 6;
+    }
 
     if (version !== 0x00010000 && version !== 0x00005000) {
       // https://learn.microsoft.com/en-us/typography/opentype/spec/maxp
@@ -2690,13 +2718,36 @@ class Font {
       writeUint32(tables.maxp.data, 0, version);
     }
 
+    let isGlyphLocationsLong = int16(
+      tables.head.data[50],
+      tables.head.data[51]
+    );
+    if (tables.loca) {
+      const locaLength = isGlyphLocationsLong
+        ? (numGlyphs + 1) * 4
+        : (numGlyphs + 1) * 2;
+      if (tables.loca.length !== locaLength) {
+        warn("Incorrect 'loca' table length -- attempting to fix it.");
+        // The length of the loca table is wrong (see #13425), so we check if we
+        // have enough space to fix it.
+        const sortedTables = Object.values(tables)
+          .filter(Boolean)
+          .sort((a, b) => a.offset - b.offset);
+        const locaIndex = sortedTables.indexOf(tables.loca);
+        const nextTable = sortedTables[locaIndex + 1] || null;
+        if (nextTable && tables.loca.offset + locaLength < nextTable.offset) {
+          const previousPos = font.pos;
+          font.pos = font.start || 0;
+          font.skip(tables.loca.offset);
+          tables.loca.data = font.getBytes(locaLength);
+          tables.loca.length = locaLength;
+          font.pos = previousPos;
+        }
+      }
+    }
+
     if (properties.scaleFactors?.length === numGlyphs && isTrueType) {
       const { scaleFactors } = properties;
-      const isGlyphLocationsLong = int16(
-        tables.head.data[50],
-        tables.head.data[51]
-      );
-
       const glyphs = new GlyfTable({
         glyfTable: tables.glyf.data,
         isGlyphLocationsLong,
@@ -2711,7 +2762,7 @@ class Font {
 
       if (isLocationLong !== !!isGlyphLocationsLong) {
         tables.head.data[50] = 0;
-        tables.head.data[51] = isLocationLong ? 1 : 0;
+        isGlyphLocationsLong = tables.head.data[51] = isLocationLong ? 1 : 0;
       }
 
       const metrics = tables.hmtx.data;
@@ -2789,10 +2840,6 @@ class Font {
 
     let missingGlyphs = Object.create(null);
     if (isTrueType) {
-      const isGlyphLocationsLong = int16(
-        tables.head.data[50],
-        tables.head.data[51]
-      );
       const glyphsInfo = sanitizeGlyphLocations(
         tables.loca,
         tables.glyf,
@@ -3068,24 +3115,6 @@ class Font {
       }
     }
 
-    if (!isTrueType) {
-      try {
-        // Trying to repair CFF file
-        cffFile = new Stream(tables["CFF "].data);
-        const parser = new CFFParser(
-          cffFile,
-          properties,
-          SEAC_ANALYSIS_ENABLED
-        );
-        cff = parser.parse();
-        cff.duplicateFirstGlyph();
-        const compiler = new CFFCompiler(cff);
-        tables["CFF "].data = compiler.compile();
-      } catch {
-        warn("Failed to compile font " + properties.loadedName);
-      }
-    }
-
     // Re-creating 'name' table
     if (!tables.name) {
       tables.name = {
@@ -3358,7 +3387,7 @@ class Font {
    * @private
    */
   _charToGlyph(charcode, isSpace = false) {
-    let glyph = this._glyphCache[charcode];
+    let glyph = this.#glyphCache.get(charcode);
     // All `Glyph`-properties, except `isSpace` in multi-byte strings,
     // depend indirectly on the `charcode`.
     if (glyph?.isSpace === isSpace) {
@@ -3378,7 +3407,7 @@ class Font {
     if (typeof width !== "number") {
       width = this.defaultWidth;
     }
-    const vmetric = this.vmetrics?.[widthCode];
+    const vmetric = this.vmetrics?.[widthCode] || this.defaultVMetrics;
 
     let unicode = this.toUnicode.get(charcode) || charcode;
     if (typeof unicode === "number") {
@@ -3453,12 +3482,13 @@ class Font {
       isSpace,
       isInFont
     );
-    return (this._glyphCache[charcode] = glyph);
+    this.#glyphCache.set(charcode, glyph);
+    return glyph;
   }
 
   charsToGlyphs(chars) {
     // If we translated this string before, just grab it from the cache.
-    let glyphs = this._charsCache[chars];
+    let glyphs = this.#charsCache.get(chars);
     if (glyphs) {
       return glyphs;
     }
@@ -3490,7 +3520,8 @@ class Font {
     }
 
     // Enter the translated string into the cache.
-    return (this._charsCache[chars] = glyphs);
+    this.#charsCache.set(chars, glyphs);
+    return glyphs;
   }
 
   /**
@@ -3522,7 +3553,7 @@ class Font {
   }
 
   get glyphCacheValues() {
-    return Object.values(this._glyphCache);
+    return this.#glyphCache.values();
   }
 
   /**

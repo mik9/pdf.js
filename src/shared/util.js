@@ -75,7 +75,9 @@ const AnnotationEditorType = {
   HIGHLIGHT: 9,
   STAMP: 13,
   INK: 15,
+  POPUP: 16,
   SIGNATURE: 101,
+  COMMENT: 102,
 };
 
 const AnnotationEditorParamsType = {
@@ -88,10 +90,9 @@ const AnnotationEditorParamsType = {
   INK_THICKNESS: 22,
   INK_OPACITY: 23,
   HIGHLIGHT_COLOR: 31,
-  HIGHLIGHT_DEFAULT_COLOR: 32,
-  HIGHLIGHT_THICKNESS: 33,
-  HIGHLIGHT_FREE: 34,
-  HIGHLIGHT_SHOW_ALL: 35,
+  HIGHLIGHT_THICKNESS: 32,
+  HIGHLIGHT_FREE: 33,
+  HIGHLIGHT_SHOW_ALL: 34,
   DRAW_STEP: 41,
 };
 
@@ -105,6 +106,12 @@ const PermissionFlag = {
   COPY_FOR_ACCESSIBILITY: 0x200,
   ASSEMBLE: 0x400,
   PRINT_HIGH_QUALITY: 0x800,
+};
+
+const MeshFigureType = {
+  TRIANGLES: 1,
+  LATTICE: 2,
+  PATCH: 3,
 };
 
 const TextRenderingMode = {
@@ -347,7 +354,8 @@ const DrawOPS = {
   moveTo: 0,
   lineTo: 1,
   curveTo: 2,
-  closePath: 3,
+  quadraticCurveTo: 3,
+  closePath: 4,
 };
 
 const PasswordResponses = {
@@ -373,7 +381,7 @@ function getVerbosityLevel() {
 function info(msg) {
   if (verbosity >= VerbosityLevel.INFOS) {
     // eslint-disable-next-line no-console
-    console.log(`Info: ${msg}`);
+    console.info(`Info: ${msg}`);
   }
 }
 
@@ -381,7 +389,7 @@ function info(msg) {
 function warn(msg) {
   if (verbosity >= VerbosityLevel.WARNINGS) {
     // eslint-disable-next-line no-console
-    console.log(`Warning: ${msg}`);
+    console.warn(`Warning: ${msg}`);
   }
 }
 
@@ -465,6 +473,11 @@ function updateUrlHash(url, hash, allowRel = false) {
     return url.split("#", 1)[0] + `${hash ? `#${hash}` : ""}`;
   }
   return "";
+}
+
+// Extract the final component from a path string.
+function stripPath(str) {
+  return str.substring(str.lastIndexOf("/") + 1);
 }
 
 function shadow(obj, prop, value, nonSerializable = false) {
@@ -642,6 +655,23 @@ class FeatureTest {
     );
   }
 
+  static get isFloat16ArraySupported() {
+    return shadow(
+      this,
+      "isFloat16ArraySupported",
+      typeof Float16Array !== "undefined"
+    );
+  }
+
+  static get isSanitizerSupported() {
+    return shadow(
+      this,
+      "isSanitizerSupported",
+      // eslint-disable-next-line no-undef
+      typeof Sanitizer !== "undefined"
+    );
+  }
+
   static get platform() {
     const { platform, userAgent } = navigator;
 
@@ -672,6 +702,10 @@ const hexNumbers = Array.from(Array(256).keys(), n =>
 class Util {
   static makeHexColor(r, g, b) {
     return `#${hexNumbers[r]}${hexNumbers[g]}${hexNumbers[b]}`;
+  }
+
+  static domMatrixToTransform(dm) {
+    return [dm.a, dm.b, dm.c, dm.d, dm.e, dm.f];
   }
 
   // Apply a scaling matrix to some min/max values.
@@ -734,6 +768,18 @@ class Util {
       m1[1] * m2[2] + m1[3] * m2[3],
       m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
       m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+    ];
+  }
+
+  // Multiplies m (an array-based transform) by md (a DOMMatrix transform).
+  static multiplyByDOMMatrix(m, md) {
+    return [
+      m[0] * md.a + m[2] * md.b,
+      m[1] * md.a + m[3] * md.b,
+      m[0] * md.c + m[2] * md.d,
+      m[1] * md.c + m[3] * md.d,
+      m[0] * md.e + m[2] * md.f + m[4],
+      m[1] * md.e + m[3] * md.f + m[5],
     ];
   }
 
@@ -1092,6 +1138,9 @@ function isArrayEqual(arr1, arr2) {
 }
 
 function getModificationDate(date = new Date()) {
+  if (!(date instanceof Date)) {
+    date = new Date(date);
+  }
   const buffer = [
     date.getUTCFullYear().toString(),
     (date.getUTCMonth() + 1).toString().padStart(2, "0"),
@@ -1185,53 +1234,24 @@ function _isValidExplicitDest(validRef, validName, dest) {
   return true;
 }
 
-// TOOD: Replace all occurrences of this function with `Math.clamp` once
+// Helpers for simple `Map.prototype.getOrInsertComputed()` invocations,
+// to avoid duplicate function creation.
+const makeArr = () => [];
+const makeMap = () => new Map();
+const makeObj = () => Object.create(null);
+
+// TODO: Replace all occurrences of this function with `Math.clamp` once
 //       https://github.com/tc39/proposal-math-clamp/ is generally available.
 function MathClamp(v, min, max) {
   return Math.min(Math.max(v, min), max);
 }
 
-// TODO: Remove this once `Uint8Array.prototype.toHex` is generally available.
-function toHexUtil(arr) {
-  if (Uint8Array.prototype.toHex) {
-    return arr.toHex();
-  }
-  return Array.from(arr, num => hexNumbers[num]).join("");
-}
-
-// TODO: Remove this once `Uint8Array.prototype.toBase64` is generally
-//       available.
-function toBase64Util(arr) {
-  if (Uint8Array.prototype.toBase64) {
-    return arr.toBase64();
-  }
-  return btoa(bytesToString(arr));
-}
-
-// TODO: Remove this once `Uint8Array.fromBase64` is generally available.
-function fromBase64Util(str) {
-  if (Uint8Array.fromBase64) {
-    return Uint8Array.fromBase64(str);
-  }
-  return stringToBytes(atob(str));
-}
-
-// TODO: Remove this once https://bugzilla.mozilla.org/show_bug.cgi?id=1928493
-//       is fixed.
+// TODO: Remove this once `Math.sumPrecise` is generally available.
 if (
-  (typeof PDFJSDev === "undefined" || PDFJSDev.test("SKIP_BABEL")) &&
-  typeof Promise.try !== "function"
+  (typeof PDFJSDev === "undefined" ||
+    PDFJSDev.test("SKIP_BABEL && !MOZCENTRAL")) &&
+  typeof Math.sumPrecise !== "function"
 ) {
-  Promise.try = function (fn, ...args) {
-    return new Promise(resolve => {
-      resolve(fn(...args));
-    });
-  };
-}
-
-// TODO: Remove this once the `javascript.options.experimental.math_sumprecise`
-//       preference is removed from Firefox.
-if (typeof Math.sumPrecise !== "function") {
   // Note that this isn't a "proper" polyfill, but since we're only using it to
   // replace `Array.prototype.reduce()` invocations it should be fine.
   Math.sumPrecise = function (numbers) {
@@ -1239,6 +1259,29 @@ if (typeof Math.sumPrecise !== "function") {
   };
 }
 
+// See https://developer.mozilla.org/en-US/docs/Web/API/Blob/bytes#browser_compatibility
+if (
+  typeof PDFJSDev !== "undefined" &&
+  !PDFJSDev.test("SKIP_BABEL") &&
+  typeof Blob.prototype.bytes !== "function"
+) {
+  Blob.prototype.bytes = async function () {
+    return new Uint8Array(await this.arrayBuffer());
+  };
+}
+
+// See https://developer.mozilla.org/en-US/docs/Web/API/Response/bytes#browser_compatibility
+if (
+  typeof PDFJSDev !== "undefined" &&
+  !PDFJSDev.test("SKIP_BABEL") &&
+  typeof Response.prototype.bytes !== "function"
+) {
+  Response.prototype.bytes = async function () {
+    return new Uint8Array(await this.arrayBuffer());
+  };
+}
+
+// TODO: Remove this once Safari 17.4 is the lowest supported version.
 if (
   typeof PDFJSDev !== "undefined" &&
   !PDFJSDev.test("SKIP_BABEL") &&
@@ -1294,7 +1337,6 @@ export {
   FeatureTest,
   FONT_IDENTITY_MATRIX,
   FormatError,
-  fromBase64Util,
   getModificationDate,
   getUuid,
   getVerbosityLevel,
@@ -1306,7 +1348,11 @@ export {
   isNodeJS,
   LINE_DESCENT_FACTOR,
   LINE_FACTOR,
+  makeArr,
+  makeMap,
+  makeObj,
   MathClamp,
+  MeshFigureType,
   normalizeUnicode,
   objectSize,
   OPS,
@@ -1322,9 +1368,8 @@ export {
   stringToBytes,
   stringToPDFString,
   stringToUTF8String,
+  stripPath,
   TextRenderingMode,
-  toBase64Util,
-  toHexUtil,
   UnknownErrorException,
   unreachable,
   updateUrlHash,

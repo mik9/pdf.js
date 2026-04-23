@@ -13,7 +13,14 @@
  * limitations under the License.
  */
 
-import { FormatError, info, unreachable, Util } from "../shared/util.js";
+import { drawMeshWithGPU, isWebGPUMeshReady } from "./webgpu_mesh.js";
+import {
+  FormatError,
+  info,
+  MeshFigureType,
+  unreachable,
+  Util,
+} from "../shared/util.js";
 import { getCurrentTransform } from "./display_utils.js";
 
 const PathType = {
@@ -65,23 +72,68 @@ class RadialAxialShadingPattern extends BaseShadingPattern {
     this.matrix = null;
   }
 
-  _createGradient(ctx) {
+  isOriginBased() {
+    return (
+      this._p0[0] === 0 &&
+      this._p0[1] === 0 &&
+      (!this.isRadial() || (this._p1[0] === 0 && this._p1[1] === 0))
+    );
+  }
+
+  isRadial() {
+    return this._type === "radial";
+  }
+
+  // Returns true when the smaller circle's center (p0 when r0 ≤ r1) lies
+  // outside the larger circle. In that case the canvas radial gradient picks
+  // t > 1 solutions for points inside the outer circle and maps them to the
+  // transparent stop we append for extendEnd=false, making the gradient
+  // invisible. A two-pass draw (reversed first, normal on top) fixes this
+  // (see #20851).
+  _isCircleCenterOutside() {
+    if (!this.isRadial() || this._r0 > this._r1) {
+      return false;
+    }
+    const dist = Math.hypot(
+      this._p0[0] - this._p1[0],
+      this._p0[1] - this._p1[1]
+    );
+    return dist > this._r1;
+  }
+
+  _createGradient(ctx, transform = null) {
     let grad;
+    let firstPoint = this._p0;
+    let secondPoint = this._p1;
+    if (transform) {
+      firstPoint = firstPoint.slice();
+      secondPoint = secondPoint.slice();
+      Util.applyTransform(firstPoint, transform);
+      Util.applyTransform(secondPoint, transform);
+    }
     if (this._type === "axial") {
       grad = ctx.createLinearGradient(
-        this._p0[0],
-        this._p0[1],
-        this._p1[0],
-        this._p1[1]
+        firstPoint[0],
+        firstPoint[1],
+        secondPoint[0],
+        secondPoint[1]
       );
     } else if (this._type === "radial") {
+      let r0 = this._r0;
+      let r1 = this._r1;
+      if (transform) {
+        const scale = new Float32Array(2);
+        Util.singularValueDecompose2dScale(transform, scale);
+        r0 *= scale[0];
+        r1 *= scale[0];
+      }
       grad = ctx.createRadialGradient(
-        this._p0[0],
-        this._p0[1],
-        this._r0,
-        this._p1[0],
-        this._p1[1],
-        this._r1
+        firstPoint[0],
+        firstPoint[1],
+        r0,
+        secondPoint[0],
+        secondPoint[1],
+        r1
       );
     }
 
@@ -91,9 +143,70 @@ class RadialAxialShadingPattern extends BaseShadingPattern {
     return grad;
   }
 
+  _createReversedGradient(ctx, transform = null) {
+    // Swapped circles: (p1, r1) → (p0, r0), with color stops reversed.
+    let firstPoint = this._p1;
+    let secondPoint = this._p0;
+    if (transform) {
+      firstPoint = firstPoint.slice();
+      secondPoint = secondPoint.slice();
+      Util.applyTransform(firstPoint, transform);
+      Util.applyTransform(secondPoint, transform);
+    }
+    let r0 = this._r1;
+    let r1 = this._r0;
+    if (transform) {
+      const scale = new Float32Array(2);
+      Util.singularValueDecompose2dScale(transform, scale);
+      r0 *= scale[0];
+      r1 *= scale[0];
+    }
+    const grad = ctx.createRadialGradient(
+      firstPoint[0],
+      firstPoint[1],
+      r0,
+      secondPoint[0],
+      secondPoint[1],
+      r1
+    );
+    const reversedStops = this._colorStops
+      .map(([t, c]) => [1 - t, c])
+      .reverse();
+    for (const [t, c] of reversedStops) {
+      grad.addColorStop(t, c);
+    }
+    return grad;
+  }
+
   getPattern(ctx, owner, inverse, pathType) {
     let pattern;
     if (pathType === PathType.STROKE || pathType === PathType.FILL) {
+      if (this.isOriginBased()) {
+        let transf = Util.transform(inverse, owner.baseTransform);
+        if (this.matrix) {
+          transf = Util.transform(transf, this.matrix);
+        }
+        const precision = 1e-3;
+        const n1 = Math.hypot(transf[0], transf[1]);
+        const n2 = Math.hypot(transf[2], transf[3]);
+        const ps = (transf[0] * transf[2] + transf[1] * transf[3]) / (n1 * n2);
+        if (Math.abs(ps) < precision) {
+          // The images of the basis vectors are orthogonal.
+          if (this.isRadial()) {
+            // If the images of the basis vectors are a square then the
+            // circles are transformed to circles and we can use a gradient
+            // directly.
+            if (Math.abs(n1 - n2) < precision) {
+              return this._createGradient(ctx, transf);
+            }
+          } else {
+            // The rectangles are transformed to rectangles and we can use a
+            // gradient directly.
+            return this._createGradient(ctx, transf);
+          }
+        }
+      }
+
       const ownerBBox = owner.current.getClippedPathBoundingBox(
         pathType,
         getCurrentTransform(ctx)
@@ -104,11 +217,7 @@ class RadialAxialShadingPattern extends BaseShadingPattern {
       const width = Math.ceil(ownerBBox[2] - ownerBBox[0]) || 1;
       const height = Math.ceil(ownerBBox[3] - ownerBBox[1]) || 1;
 
-      const tmpCanvas = owner.cachedCanvases.getCanvas(
-        "pattern",
-        width,
-        height
-      );
+      const tmpCanvas = owner.canvasFactory.create(width, height);
 
       const tmpCtx = tmpCanvas.context;
       tmpCtx.clearRect(0, 0, tmpCtx.canvas.width, tmpCtx.canvas.height);
@@ -133,16 +242,30 @@ class RadialAxialShadingPattern extends BaseShadingPattern {
       }
       applyBoundingBox(tmpCtx, this._bbox);
 
+      if (this._isCircleCenterOutside()) {
+        tmpCtx.fillStyle = this._createReversedGradient(tmpCtx);
+        tmpCtx.fill();
+      }
       tmpCtx.fillStyle = this._createGradient(tmpCtx);
       tmpCtx.fill();
 
       pattern = ctx.createPattern(tmpCanvas.canvas, "no-repeat");
+      owner.canvasFactory.destroy(tmpCanvas);
       const domMatrix = new DOMMatrix(inverse);
       pattern.setTransform(domMatrix);
     } else {
       // Shading fills are applied relative to the current matrix which is also
       // how canvas gradients work, so there's no need to do anything special
       // here.
+      if (this._isCircleCenterOutside()) {
+        // Draw the reversed gradient first so the normal gradient can
+        // correctly overlay it (see _isCircleCenterOutside for details).
+        ctx.save();
+        applyBoundingBox(ctx, this._bbox);
+        ctx.fillStyle = this._createReversedGradient(ctx);
+        ctx.fillRect(-1e10, -1e10, 2e10, 2e10);
+        ctx.restore();
+      }
       applyBoundingBox(ctx, this._bbox);
       pattern = this._createGradient(ctx);
     }
@@ -157,7 +280,7 @@ function drawTriangle(data, context, p1, p2, p3, c1, c2, c3) {
   const bytes = data.data,
     rowSize = data.width * 4;
   let tmp;
-  if (coords[p1 + 1] > coords[p2 + 1]) {
+  if (coords[p1 * 2 + 1] > coords[p2 * 2 + 1]) {
     tmp = p1;
     p1 = p2;
     p2 = tmp;
@@ -165,7 +288,7 @@ function drawTriangle(data, context, p1, p2, p3, c1, c2, c3) {
     c1 = c2;
     c2 = tmp;
   }
-  if (coords[p2 + 1] > coords[p3 + 1]) {
+  if (coords[p2 * 2 + 1] > coords[p3 * 2 + 1]) {
     tmp = p2;
     p2 = p3;
     p3 = tmp;
@@ -173,7 +296,7 @@ function drawTriangle(data, context, p1, p2, p3, c1, c2, c3) {
     c2 = c3;
     c3 = tmp;
   }
-  if (coords[p1 + 1] > coords[p2 + 1]) {
+  if (coords[p1 * 2 + 1] > coords[p2 * 2 + 1]) {
     tmp = p1;
     p1 = p2;
     p2 = tmp;
@@ -181,24 +304,24 @@ function drawTriangle(data, context, p1, p2, p3, c1, c2, c3) {
     c1 = c2;
     c2 = tmp;
   }
-  const x1 = (coords[p1] + context.offsetX) * context.scaleX;
-  const y1 = (coords[p1 + 1] + context.offsetY) * context.scaleY;
-  const x2 = (coords[p2] + context.offsetX) * context.scaleX;
-  const y2 = (coords[p2 + 1] + context.offsetY) * context.scaleY;
-  const x3 = (coords[p3] + context.offsetX) * context.scaleX;
-  const y3 = (coords[p3 + 1] + context.offsetY) * context.scaleY;
+  const x1 = (coords[p1 * 2] + context.offsetX) * context.scaleX;
+  const y1 = (coords[p1 * 2 + 1] + context.offsetY) * context.scaleY;
+  const x2 = (coords[p2 * 2] + context.offsetX) * context.scaleX;
+  const y2 = (coords[p2 * 2 + 1] + context.offsetY) * context.scaleY;
+  const x3 = (coords[p3 * 2] + context.offsetX) * context.scaleX;
+  const y3 = (coords[p3 * 2 + 1] + context.offsetY) * context.scaleY;
   if (y1 >= y3) {
     return;
   }
-  const c1r = colors[c1],
-    c1g = colors[c1 + 1],
-    c1b = colors[c1 + 2];
-  const c2r = colors[c2],
-    c2g = colors[c2 + 1],
-    c2b = colors[c2 + 2];
-  const c3r = colors[c3],
-    c3g = colors[c3 + 1],
-    c3b = colors[c3 + 2];
+  const c1r = colors[c1 * 4],
+    c1g = colors[c1 * 4 + 1],
+    c1b = colors[c1 * 4 + 2];
+  const c2r = colors[c2 * 4],
+    c2g = colors[c2 * 4 + 1],
+    c2b = colors[c2 * 4 + 2];
+  const c3r = colors[c3 * 4],
+    c3g = colors[c3 * 4 + 1],
+    c3b = colors[c3 * 4 + 2];
 
   const minY = Math.round(y1),
     maxY = Math.round(y3);
@@ -261,7 +384,7 @@ function drawFigure(data, figure, context) {
   const cs = figure.colors;
   let i, ii;
   switch (figure.type) {
-    case "lattice":
+    case MeshFigureType.LATTICE:
       const verticesPerRow = figure.verticesPerRow;
       const rows = Math.floor(ps.length / verticesPerRow) - 1;
       const cols = verticesPerRow - 1;
@@ -291,7 +414,7 @@ function drawFigure(data, figure, context) {
         }
       }
       break;
-    case "triangles":
+    case MeshFigureType.TRIANGLES:
       for (i = 0, ii = ps.length; i < ii; i += 3) {
         drawTriangle(
           data,
@@ -322,7 +445,7 @@ class MeshShadingPattern extends BaseShadingPattern {
     this.matrix = null;
   }
 
-  _createMeshCanvas(combinedScale, backgroundColor, cachedCanvases) {
+  _createMeshCanvas(combinedScale, backgroundColor, canvasFactory) {
     // we will increase scale on some weird factor to let antialiasing take
     // care of "rough" edges
     const EXPECTED_SCALE = 1.1;
@@ -337,16 +460,20 @@ class MeshShadingPattern extends BaseShadingPattern {
     const boundsWidth = Math.ceil(this._bounds[2]) - offsetX;
     const boundsHeight = Math.ceil(this._bounds[3]) - offsetY;
 
-    const width = Math.min(
-      Math.ceil(Math.abs(boundsWidth * combinedScale[0] * EXPECTED_SCALE)),
-      MAX_PATTERN_SIZE
-    );
-    const height = Math.min(
-      Math.ceil(Math.abs(boundsHeight * combinedScale[1] * EXPECTED_SCALE)),
-      MAX_PATTERN_SIZE
-    );
-    const scaleX = boundsWidth / width;
-    const scaleY = boundsHeight / height;
+    // Ensure that the shading has non-zero width and height, to prevent errors
+    // in `pattern_helper.js` (fixes issue17848.pdf).
+    const width =
+      Math.min(
+        Math.ceil(Math.abs(boundsWidth * combinedScale[0] * EXPECTED_SCALE)),
+        MAX_PATTERN_SIZE
+      ) || 1;
+    const height =
+      Math.min(
+        Math.ceil(Math.abs(boundsHeight * combinedScale[1] * EXPECTED_SCALE)),
+        MAX_PATTERN_SIZE
+      ) || 1;
+    const scaleX = boundsWidth ? boundsWidth / width : 1;
+    const scaleY = boundsHeight ? boundsHeight / height : 1;
 
     const context = {
       coords: this._coords,
@@ -359,32 +486,40 @@ class MeshShadingPattern extends BaseShadingPattern {
 
     const paddedWidth = width + BORDER_SIZE * 2;
     const paddedHeight = height + BORDER_SIZE * 2;
+    const tmpCanvas = canvasFactory.create(paddedWidth, paddedHeight);
 
-    const tmpCanvas = cachedCanvases.getCanvas(
-      "mesh",
-      paddedWidth,
-      paddedHeight
-    );
-    const tmpCtx = tmpCanvas.context;
-
-    const data = tmpCtx.createImageData(width, height);
-    if (backgroundColor) {
-      const bytes = data.data;
-      for (let i = 0, ii = bytes.length; i < ii; i += 4) {
-        bytes[i] = backgroundColor[0];
-        bytes[i + 1] = backgroundColor[1];
-        bytes[i + 2] = backgroundColor[2];
-        bytes[i + 3] = 255;
+    if (isWebGPUMeshReady()) {
+      tmpCanvas.context.drawImage(
+        drawMeshWithGPU(
+          this._figures,
+          context,
+          backgroundColor,
+          paddedWidth,
+          paddedHeight,
+          BORDER_SIZE
+        ),
+        0,
+        0
+      );
+    } else {
+      const data = tmpCanvas.context.createImageData(width, height);
+      if (backgroundColor) {
+        const bytes = data.data;
+        for (let i = 0, ii = bytes.length; i < ii; i += 4) {
+          bytes[i] = backgroundColor[0];
+          bytes[i + 1] = backgroundColor[1];
+          bytes[i + 2] = backgroundColor[2];
+          bytes[i + 3] = 255;
+        }
       }
+      for (const figure of this._figures) {
+        drawFigure(data, figure, context);
+      }
+      tmpCanvas.context.putImageData(data, BORDER_SIZE, BORDER_SIZE);
     }
-    for (const figure of this._figures) {
-      drawFigure(data, figure, context);
-    }
-    tmpCtx.putImageData(data, BORDER_SIZE, BORDER_SIZE);
-    const canvas = tmpCanvas.canvas;
 
     return {
-      canvas,
+      canvas: tmpCanvas.canvas,
       offsetX: offsetX - BORDER_SIZE * scaleX,
       offsetY: offsetY - BORDER_SIZE * scaleY,
       scaleX,
@@ -417,7 +552,7 @@ class MeshShadingPattern extends BaseShadingPattern {
     const temporaryPatternCanvas = this._createMeshCanvas(
       scale,
       pathType === PathType.SHADING ? null : this._background,
-      owner.cachedCanvases
+      owner.canvasFactory
     );
 
     if (pathType !== PathType.SHADING) {
@@ -433,7 +568,12 @@ class MeshShadingPattern extends BaseShadingPattern {
     );
     ctx.scale(temporaryPatternCanvas.scaleX, temporaryPatternCanvas.scaleY);
 
-    return ctx.createPattern(temporaryPatternCanvas.canvas, "no-repeat");
+    const pattern = ctx.createPattern(
+      temporaryPatternCanvas.canvas,
+      "no-repeat"
+    );
+    owner.canvasFactory.destroy(temporaryPatternCanvas);
+    return pattern;
   }
 }
 
@@ -478,7 +618,7 @@ class TilingPattern {
     this.baseTransform = baseTransform;
   }
 
-  createPatternCanvas(owner) {
+  createPatternCanvas(owner, opIdx) {
     const {
       bbox,
       operatorList,
@@ -561,23 +701,32 @@ class TilingPattern {
       combinedScaleY
     );
 
-    const tmpCanvas = owner.cachedCanvases.getCanvas(
-      "pattern",
-      dimx.size,
-      dimy.size
-    );
+    const tmpCanvas = owner.canvasFactory.create(dimx.size, dimy.size);
     const tmpCtx = tmpCanvas.context;
-    const graphics = canvasGraphicsFactory.createCanvasGraphics(tmpCtx);
+    const graphics = canvasGraphicsFactory.createCanvasGraphics(tmpCtx, opIdx);
     graphics.groupLevel = owner.groupLevel;
 
     this.setFillAndStrokeStyleToContext(graphics, paintType, color);
 
     tmpCtx.translate(-dimx.scale * x0, -dimy.scale * y0);
-    graphics.transform(dimx.scale, 0, 0, dimy.scale, 0, 0);
+    graphics.transform(
+      // We pass 0 as the 'opIdx' argument, but the value is irrelevant.
+      // We know that we are in a 'CanvasNestedDependencyTracker' that captures
+      // all the sub-operations needed to create this pattern canvas and uses
+      // the top-level operation index as their index.
+      0,
+      dimx.scale,
+      0,
+      0,
+      dimy.scale,
+      0,
+      0
+    );
 
     // To match CanvasGraphics beginDrawing we must save the context here or
     // else we end up with unbalanced save/restores.
     tmpCtx.save();
+    graphics.dependencyTracker?.save();
 
     this.clipBbox(graphics, x0, y0, x1, y1);
 
@@ -587,6 +736,7 @@ class TilingPattern {
 
     graphics.endDrawing();
 
+    graphics.dependencyTracker?.restore();
     tmpCtx.restore();
 
     if (redrawHorizontally || redrawVertically) {
@@ -618,11 +768,7 @@ class TilingPattern {
 
       const xSize = dimx2.size;
       const ySize = dimy2.size;
-      const tmpCanvas2 = owner.cachedCanvases.getCanvas(
-        "pattern-workaround",
-        xSize,
-        ySize
-      );
+      const tmpCanvas2 = owner.canvasFactory.create(xSize, ySize);
       const tmpCtx2 = tmpCanvas2.context;
       const ii = redrawHorizontally ? Math.floor(width / xstep) : 0;
       const jj = redrawVertically ? Math.floor(height / ystep) : 0;
@@ -643,8 +789,10 @@ class TilingPattern {
           );
         }
       }
+      owner.canvasFactory.destroy(tmpCanvas);
       return {
         canvas: tmpCanvas2.canvas,
+        canvasEntry: tmpCanvas2,
         scaleX: dimx2.scale,
         scaleY: dimy2.scale,
         offsetX: x0,
@@ -654,6 +802,7 @@ class TilingPattern {
 
     return {
       canvas: tmpCanvas.canvas,
+      canvasEntry: tmpCanvas,
       scaleX: dimx.scale,
       scaleY: dimy.scale,
       offsetX: x0,
@@ -712,7 +861,7 @@ class TilingPattern {
     return false;
   }
 
-  getPattern(ctx, owner, inverse, pathType) {
+  getPattern(ctx, owner, inverse, pathType, opIdx) {
     // PDF spec 8.7.2 NOTE 1: pattern's matrix is relative to initial matrix.
     let matrix = inverse;
     if (pathType !== PathType.SHADING) {
@@ -722,7 +871,7 @@ class TilingPattern {
       }
     }
 
-    const temporaryPatternCanvas = this.createPatternCanvas(owner);
+    const temporaryPatternCanvas = this.createPatternCanvas(owner, opIdx);
 
     let domMatrix = new DOMMatrix(matrix);
     // Rescale and so that the ctx.createPattern call generates a pattern with
@@ -737,6 +886,7 @@ class TilingPattern {
     );
 
     const pattern = ctx.createPattern(temporaryPatternCanvas.canvas, "repeat");
+    owner.canvasFactory.destroy(temporaryPatternCanvas.canvasEntry);
     pattern.setTransform(domMatrix);
 
     return pattern;

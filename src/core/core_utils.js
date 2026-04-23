@@ -18,6 +18,7 @@ import {
   assert,
   BaseException,
   hexNumbers,
+  makeArr,
   objectSize,
   stringToPDFString,
   Util,
@@ -129,7 +130,7 @@ async function fetchBinaryData(url) {
       `Failed to fetch file "${url}" with "${response.statusText}".`
     );
   }
-  return new Uint8Array(await response.arrayBuffer());
+  return response.bytes();
 }
 
 /**
@@ -205,6 +206,38 @@ function getParentToUpdate(dict, ref, xref) {
     result.ref = ref;
   }
   return result;
+}
+
+function deepCompare(a, b) {
+  if (a === b) {
+    return true;
+  }
+  if (a instanceof Dict && b instanceof Dict) {
+    if (a.size !== b.size) {
+      return false;
+    }
+    for (const [key, value1] of a.getRawEntries()) {
+      const value2 = b.getRaw(key);
+      if (value2 === undefined || !deepCompare(value1, value2)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) {
+      return false;
+    }
+    for (let i = 0, ii = a.length; i < ii; i++) {
+      if (!deepCompare(a[i], b[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  return false;
 }
 
 // prettier-ignore
@@ -429,7 +462,7 @@ function _collectJS(entry, xref, list, parents) {
         /* keepEscapeSequence = */ true
       ).replaceAll("\x00", "");
       if (code) {
-        list.push(code);
+        list.push(code.trim());
       }
     }
     _collectJS(entry.getRaw("Next"), xref, list, parents);
@@ -458,15 +491,14 @@ function collectActions(xref, dict, eventType) {
       if (!(additionalActions instanceof Dict)) {
         continue;
       }
-      for (const key of additionalActions.getKeys()) {
+      for (const [key, rawActionDict] of additionalActions.getRawEntries()) {
         const action = eventType[key];
         if (!action) {
           continue;
         }
-        const actionDict = additionalActions.getRaw(key);
         const parents = new RefSet();
         const list = [];
-        _collectJS(actionDict, xref, list, parents);
+        _collectJS(rawActionDict, xref, list, parents);
         if (list.length > 0) {
           actions[action] = list;
         }
@@ -669,22 +701,26 @@ function getNewAnnotationsMap(annotationStorage) {
     if (!key.startsWith(AnnotationEditorPrefix)) {
       continue;
     }
-    let annotations = newAnnotationsByPage.get(value.pageIndex);
-    if (!annotations) {
-      annotations = [];
-      newAnnotationsByPage.set(value.pageIndex, annotations);
-    }
-    annotations.push(value);
+    newAnnotationsByPage
+      .getOrInsertComputed(value.pageIndex, makeArr)
+      .push(value);
   }
   return newAnnotationsByPage.size > 0 ? newAnnotationsByPage : null;
 }
 
+// If the string is null or undefined then it is returned as is.
 function stringToAsciiOrUTF16BE(str) {
+  if (str === null || str === undefined) {
+    return str;
+  }
   return isAscii(str) ? str : stringToUTF16String(str, /* bigEndian = */ true);
 }
 
 function isAscii(str) {
-  return /^[\x00-\x7F]*$/.test(str);
+  if (typeof str !== "string") {
+    return false;
+  }
+  return !str || /^[\x00-\x7F]*$/.test(str);
 }
 
 function stringToUTF16HexString(str) {
@@ -741,6 +777,7 @@ export {
   arrayBuffersToBytes,
   codePointIter,
   collectActions,
+  deepCompare,
   encodeToXmlString,
   escapePDFName,
   escapeString,

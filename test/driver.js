@@ -257,10 +257,8 @@ class Rasterize {
       // Rendering annotation layer as HTML.
       const parameters = {
         annotations,
-        linkService: new SimpleLinkService(),
         imageResourcesPath,
         renderForms,
-        annotationStorage,
         fieldObjects,
       };
 
@@ -272,6 +270,8 @@ class Rasterize {
         annotationCanvasMap: annotationImageMap,
         page,
         viewport: annotationViewport,
+        linkService: new SimpleLinkService(),
+        annotationStorage,
       });
       await annotationLayer.render(parameters);
       await annotationLayer.showPopups();
@@ -377,7 +377,7 @@ class Rasterize {
           height: height / pageHeight,
         });
       }
-      // We set the borderWidth to 0.001 to slighly increase the size of the
+      // We set the borderWidth to 0.001 to slightly increase the size of the
       // boxes so that they can be merged together.
       const outliner = new HighlightOutliner(boxes, /* borderWidth = */ 0.001);
       // We set the borderWidth to 0.0025 in order to have an outline which is
@@ -505,7 +505,7 @@ class Driver {
     this.delay = params.get("delay") | 0;
     this.inFlightRequests = 0;
     this.testFilter = JSON.parse(params.get("testfilter") || "[]");
-    this.xfaOnly = params.get("xfaonly") === "true";
+    this.masterMode = params.get("mastermode") === "true";
 
     // Create a working canvas
     this.canvas = document.createElement("canvas");
@@ -543,12 +543,9 @@ class Driver {
       this._log("done\n");
       this.manifest = await response.json();
 
-      if (this.testFilter?.length || this.xfaOnly) {
+      if (this.testFilter?.length) {
         this.manifest = this.manifest.filter(item => {
           if (this.testFilter.includes(item.id)) {
-            return true;
-          }
-          if (this.xfaOnly && item.enableXfa) {
             return true;
           }
           return false;
@@ -591,6 +588,25 @@ class Driver {
       task.stats = { times: [] };
       task.enableXfa = task.enableXfa === true;
 
+      if (task.includePages && task.type === "extract") {
+        if (this.masterMode) {
+          const includePages = [];
+          for (const page of task.includePages) {
+            if (Array.isArray(page)) {
+              for (let i = page[0]; i <= page[1]; i++) {
+                includePages.push(i);
+              }
+            } else {
+              includePages.push(page);
+            }
+          }
+          task.numberOfTasks = includePages.length;
+          task.includePages = includePages;
+        } else {
+          delete task.pageMapping;
+        }
+      }
+
       const prevFile = md5FileMap.get(task.md5);
       if (prevFile) {
         if (task.file !== prevFile) {
@@ -604,10 +620,21 @@ class Driver {
         md5FileMap.set(task.md5, task.file);
       }
 
+      this._log(
+        `[${this.currentTask + 1}/${this.manifest.length}] ${task.id}:\n`
+      );
+
+      if (task.type === "skip-because-failing") {
+        this._log(`  Skipping file "${task.file} because it's failing"\n`);
+        this.currentTask++;
+        this._nextTask();
+        return;
+      }
+
       // Support *linked* test-cases for the other suites, e.g. unit- and
       // integration-tests, without needing to run them as reference-tests.
       if (task.type === "other") {
-        this._log(`Skipping file "${task.file}"\n`);
+        this._log(`  Skipping file "${task.file}"\n`);
 
         if (!task.link) {
           this._nextPage(task, 'Expected "other" test-case to be linked.');
@@ -618,7 +645,7 @@ class Driver {
         return;
       }
 
-      this._log('Loading file "' + task.file + '"\n');
+      this._log(`  Loading file "${task.file}"\n`);
 
       try {
         let xfaStyleElement = null;
@@ -635,7 +662,7 @@ class Driver {
           task.isOffscreenCanvasSupported === false ? false : undefined;
         const disableFontFace = task.disableFontFace === true;
 
-        const loadingTask = getDocument({
+        const documentOptions = {
           url: new URL(task.file, window.location),
           password: task.password,
           cMapUrl: CMAP_URL,
@@ -651,8 +678,25 @@ class Driver {
           isOffscreenCanvasSupported,
           styleElement: xfaStyleElement,
           disableFontFace,
-        });
+        };
+        const loadingTask = getDocument(documentOptions);
         let promise = loadingTask.promise;
+
+        if (!this.masterMode && task.type === "extract") {
+          promise = promise.then(async doc => {
+            const extractedDocumentOptions = { ...documentOptions };
+            delete extractedDocumentOptions.url;
+            extractedDocumentOptions.data = await doc.extractPages([
+              {
+                document: null,
+                includePages: task.includePages,
+              },
+            ]);
+            await loadingTask.destroy();
+            delete task.includePages;
+            return getDocument(extractedDocumentOptions).promise;
+          });
+        }
 
         if (task.annotationStorage) {
           for (const annotation of Object.values(task.annotationStorage)) {
@@ -758,6 +802,10 @@ class Driver {
             }
 
             task.pdfDoc = doc;
+            if (!task.save && task.print && task.annotationStorage) {
+              doc.annotationStorage._setValues(task.annotationStorage);
+              task.printAnnotationStorage = doc.annotationStorage.print;
+            }
             task.optionalContentConfigPromise = doc.getOptionalContentConfig({
               intent: task.print ? "print" : "display",
             });
@@ -849,7 +897,7 @@ class Driver {
 
     if (task.pageNum > this._getLastPageNumber(task)) {
       if (++task.round < task.rounds) {
-        this._log(" Round " + (1 + task.round) + "\n");
+        this._log(`  Round ${1 + task.round}\n`);
         task.pageNum = task.firstPage || 1;
       } else {
         this.currentTask++;
@@ -858,9 +906,14 @@ class Driver {
       }
     }
 
-    if (task.skipPages?.includes(task.pageNum)) {
+    if (
+      task.skipPages?.includes(task.pageNum) ||
+      (this.masterMode &&
+        task.includePages &&
+        !task.includePages.includes(task.pageNum - 1))
+    ) {
       this._log(
-        " Skipping page " + task.pageNum + "/" + task.pdfDoc.numPages + "...\n"
+        `    Skipping page ${task.pageNum}/${task.pdfDoc.numPages}...\n`
       );
       task.pageNum++;
       this._nextPage(task);
@@ -870,7 +923,7 @@ class Driver {
     if (!failure) {
       try {
         this._log(
-          " Loading page " + task.pageNum + "/" + task.pdfDoc.numPages + "... "
+          `    Loading page ${task.pageNum}/${task.pdfDoc.numPages}... `
         );
         ctx = this.canvas.getContext("2d", { alpha: false });
         task.pdfDoc.getPage(task.pageNum).then(
@@ -916,9 +969,10 @@ class Driver {
               renderPrint = false,
               renderXfa = false,
               annotationCanvasMap = null,
-              pageColors = null;
+              pageColors = null,
+              partialCrop = null;
 
-            if (task.annotationStorage) {
+            if (!task.print && task.annotationStorage) {
               task.pdfDoc.annotationStorage._setValues(task.annotationStorage);
             }
 
@@ -964,10 +1018,14 @@ class Driver {
               textLayerCanvas = null;
               // We fetch the `eq` specific test subtypes here, to avoid
               // accidentally changing the behaviour for other types of tests.
-              renderAnnotations = !!task.annotations;
-              renderForms = !!task.forms;
-              renderPrint = !!task.print;
-              renderXfa = !!task.enableXfa;
+
+              partialCrop = task.partial;
+              if (!partialCrop) {
+                renderAnnotations = !!task.annotations;
+                renderForms = !!task.forms;
+                renderPrint = !!task.print;
+                renderXfa = !!task.enableXfa;
+              }
               pageColors = task.pageColors || null;
 
               // Render the annotation layer if necessary.
@@ -1012,7 +1070,7 @@ class Driver {
               }
             }
             const renderContext = {
-              canvasContext: ctx,
+              canvas: this.canvas,
               viewport,
               optionalContentConfigPromise: task.optionalContentConfigPromise,
               annotationCanvasMap,
@@ -1024,8 +1082,13 @@ class Driver {
             } else if (renderPrint) {
               if (task.annotationStorage) {
                 renderContext.annotationMode = AnnotationMode.ENABLE_STORAGE;
+                renderContext.printAnnotationStorage =
+                  task.printAnnotationStorage;
               }
               renderContext.intent = "print";
+            }
+            if (partialCrop) {
+              renderContext.recordOperations = true;
             }
 
             const completeRender = error => {
@@ -1057,7 +1120,7 @@ class Driver {
               this._snapshot(task, error);
             };
             initPromise
-              .then(data => {
+              .then(async data => {
                 const renderTask = page.render(renderContext);
 
                 if (task.renderTaskOnContinue) {
@@ -1066,26 +1129,111 @@ class Driver {
                     setTimeout(cont, RENDER_TASK_ON_CONTINUE_DELAY);
                   };
                 }
-                return renderTask.promise.then(() => {
-                  if (annotationCanvasMap) {
-                    Rasterize.annotationLayer(
-                      annotationLayerContext,
-                      viewport,
-                      outputScale,
-                      data,
-                      annotationCanvasMap,
-                      task.pdfDoc.annotationStorage,
-                      task.fieldObjects,
-                      page,
-                      IMAGE_RESOURCES_PATH,
-                      renderForms
-                    ).then(() => {
-                      completeRender(false);
-                    });
-                  } else {
-                    completeRender(false);
+                await renderTask.promise;
+
+                if (partialCrop) {
+                  const clearOutsidePartial = () => {
+                    const { width, height } = ctx.canvas;
+                    // Everything above the partial area
+                    ctx.clearRect(
+                      0,
+                      0,
+                      width,
+                      Math.ceil(partialCrop.minY * height)
+                    );
+                    // Everything below the partial area
+                    ctx.clearRect(
+                      0,
+                      Math.floor(partialCrop.maxY * height),
+                      width,
+                      height
+                    );
+                    // Everything to the left of the partial area
+                    ctx.clearRect(
+                      0,
+                      0,
+                      Math.ceil(partialCrop.minX * width),
+                      height
+                    );
+                    // Everything to the right of the partial area
+                    ctx.clearRect(
+                      Math.floor(partialCrop.maxX * width),
+                      0,
+                      width,
+                      height
+                    );
+                  };
+
+                  clearOutsidePartial();
+                  const baseline = ctx.canvas.toDataURL("image/png");
+                  this._clearCanvas();
+
+                  const recordedBBoxes = page.recordedBBoxes;
+
+                  const partialRenderContext = {
+                    canvasContext: ctx,
+                    viewport,
+                    optionalContentConfigPromise:
+                      task.optionalContentConfigPromise,
+                    annotationCanvasMap,
+                    pageColors,
+                    transform,
+                    recordOperations: false,
+                    operationsFilter(index) {
+                      if (recordedBBoxes.isEmpty(index)) {
+                        return false;
+                      }
+                      return (
+                        recordedBBoxes.minX(index) <= partialCrop.maxX &&
+                        recordedBBoxes.maxX(index) >= partialCrop.minX &&
+                        recordedBBoxes.minY(index) <= partialCrop.maxY &&
+                        recordedBBoxes.maxY(index) >= partialCrop.minY
+                      );
+                    },
+                  };
+
+                  const partialRenderTask = page.render(partialRenderContext);
+                  await partialRenderTask.promise;
+
+                  clearOutsidePartial();
+
+                  if (page.stats) {
+                    // Get the page stats *before* running cleanup.
+                    task.stats = page.stats;
                   }
-                });
+                  page.cleanup(/* resetStats = */ true);
+                  this._snapshot(
+                    task,
+                    false,
+                    // Sometimes the optimized version does not match the
+                    // baseline. Tests marked as "knownPartialMismatch" have
+                    // been manually verified to be good enough (e.g. there is
+                    // one pixel of a very slightly different shade), so we
+                    // avoid compating them to the non-optimized version and
+                    // instead use the optimized version also for makeref.
+                    task.knownPartialMismatch ? null : baseline
+                  );
+                  return;
+                }
+
+                if (annotationCanvasMap) {
+                  Rasterize.annotationLayer(
+                    annotationLayerContext,
+                    viewport,
+                    outputScale,
+                    data,
+                    annotationCanvasMap,
+                    task.pdfDoc.annotationStorage,
+                    task.fieldObjects,
+                    page,
+                    IMAGE_RESOURCES_PATH,
+                    renderForms
+                  ).then(() => {
+                    completeRender(false);
+                  });
+                } else {
+                  completeRender(false);
+                }
               })
               .catch(function (error) {
                 completeRender("render : " + error);
@@ -1108,11 +1256,16 @@ class Driver {
     ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
   }
 
-  _snapshot(task, failure) {
+  _snapshot(task, failure, baselineDataUrl = null) {
     this._log("Snapshotting... ");
 
     const dataUrl = this.canvas.toDataURL("image/png");
-    this._sendResult(dataUrl, task, failure).then(() => {
+
+    if (baselineDataUrl && baselineDataUrl !== dataUrl) {
+      failure ||= "Optimized rendering differs from full rendering.";
+    }
+
+    this._sendResult(dataUrl, task, failure, baselineDataUrl).then(() => {
       this._log(
         "done" + (failure ? " (failed !: " + failure + ")" : "") + "\n"
       );
@@ -1166,17 +1319,19 @@ class Driver {
     }
   }
 
-  _sendResult(snapshot, task, failure) {
+  _sendResult(snapshot, task, failure, baselineSnapshot = null) {
     const result = JSON.stringify({
       browser: this.browser,
       id: task.id,
       numPages: task.pdfDoc ? task.lastPage || task.pdfDoc.numPages : 0,
       lastPageNum: this._getLastPageNumber(task),
+      numberOfTasks: task.numberOfTasks ?? -1,
       failure,
       file: task.file,
       round: task.round,
-      page: task.pageNum,
+      page: task.pageMapping?.[task.pageNum] ?? task.pageNum,
       snapshot,
+      baselineSnapshot,
       stats: task.stats.times,
       viewportWidth: task.viewportWidth,
       viewportHeight: task.viewportHeight,

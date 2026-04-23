@@ -22,6 +22,7 @@ import {
 } from "../shared/util.js";
 import { ChunkedStreamManager } from "./chunked_stream.js";
 import { ImageResizer } from "./image_resizer.js";
+import { JBig2CCITTFaxWasmImage } from "./jbig2_ccittFax_wasm.js";
 import { JpegStream } from "./jpeg_stream.js";
 import { JpxImage } from "./jpx.js";
 import { MissingDataException } from "./core_utils.js";
@@ -70,6 +71,20 @@ class BasePdfManager {
       FeatureTest.isOffscreenCanvasSupported;
     evaluatorOptions.isImageDecoderSupported &&=
       FeatureTest.isImageDecoderSupported;
+
+    // Set up a one-shot callback so evaluators can notify the main thread that
+    // WebGPU-acceleratable content was found. The flag ensures the message is
+    // sent at most once per document.
+    if (evaluatorOptions.enableWebGPU) {
+      let prepareWebGPUSent = false;
+      evaluatorOptions.prepareWebGPU = () => {
+        if (!prepareWebGPUSent) {
+          prepareWebGPUSent = true;
+          handler.send("PrepareWebGPU", null);
+        }
+      };
+    }
+    delete evaluatorOptions.enableWebGPU;
     this.evaluatorOptions = Object.freeze(evaluatorOptions);
 
     // Initialize image-options once per document.
@@ -81,6 +96,7 @@ class BasePdfManager {
     JpxImage.setOptions(options);
     IccColorSpace.setOptions(options);
     CmykICCBasedCS.setOptions(options);
+    JBig2CCITTFaxWasmImage.setOptions(options);
   }
 
   get docId() {

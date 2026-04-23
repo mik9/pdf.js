@@ -16,8 +16,11 @@
 import {
   assert,
   bytesToString,
+  DrawOPS,
+  FeatureTest,
   FONT_IDENTITY_MATRIX,
   FormatError,
+  shadow,
   unreachable,
   Util,
   warn,
@@ -169,16 +172,16 @@ function compileGlyf(code, cmds, font) {
   function moveTo(x, y) {
     if (firstPoint) {
       // Close the current subpath in adding a straight line to the first point.
-      cmds.add("L", firstPoint);
+      cmds.add(DrawOPS.lineTo, firstPoint);
     }
     firstPoint = [x, y];
-    cmds.add("M", [x, y]);
+    cmds.add(DrawOPS.moveTo, [x, y]);
   }
   function lineTo(x, y) {
-    cmds.add("L", [x, y]);
+    cmds.add(DrawOPS.lineTo, [x, y]);
   }
   function quadraticCurveTo(xa, ya, x, y) {
-    cmds.add("Q", [xa, ya, x, y]);
+    cmds.add(DrawOPS.quadraticCurveTo, [xa, ya, x, y]);
   }
 
   let i = 0;
@@ -355,16 +358,16 @@ function compileCharString(charStringCode, cmds, font, glyphId) {
   function moveTo(x, y) {
     if (firstPoint) {
       // Close the current subpath in adding a straight line to the first point.
-      cmds.add("L", firstPoint);
+      cmds.add(DrawOPS.lineTo, firstPoint);
     }
     firstPoint = [x, y];
-    cmds.add("M", [x, y]);
+    cmds.add(DrawOPS.moveTo, [x, y]);
   }
   function lineTo(x, y) {
-    cmds.add("L", [x, y]);
+    cmds.add(DrawOPS.lineTo, [x, y]);
   }
   function bezierCurveTo(x1, y1, x2, y2, x, y) {
-    cmds.add("C", [x1, y1, x2, y2, x, y]);
+    cmds.add(DrawOPS.curveTo, [x1, y1, x2, y2, x, y]);
   }
 
   const stack = [];
@@ -734,8 +737,6 @@ function compileCharString(charStringCode, cmds, font, glyphId) {
   parse(charStringCode);
 }
 
-const NOOP = "";
-
 class Commands {
   cmds = [];
 
@@ -749,7 +750,7 @@ class Commands {
       for (let i = 0, ii = args.length; i < ii; i += 2) {
         Util.applyTransform(args, currentTransform, i);
       }
-      this.cmds.push(`${cmd}${args.join(" ")}`);
+      this.cmds.push(cmd, ...args);
     } else {
       this.cmds.push(cmd);
     }
@@ -771,8 +772,14 @@ class Commands {
     this.currentTransform = this.transformStack.pop() || [1, 0, 0, 1, 0, 0];
   }
 
-  getSVG() {
-    return this.cmds.join("");
+  getPath() {
+    if (
+      (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) ||
+      FeatureTest.isFloat16ArraySupported
+    ) {
+      return new Float16Array(this.cmds);
+    }
+    return new Float32Array(this.cmds);
   }
 }
 
@@ -790,6 +797,17 @@ class CompiledFont {
     this.compiledCharCodeToGlyphId = Object.create(null);
   }
 
+  static get NOOP() {
+    return shadow(
+      this,
+      "NOOP",
+      (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) ||
+        FeatureTest.isFloat16ArraySupported
+        ? new Float16Array(0)
+        : new Float32Array(0)
+    );
+  }
+
   getPathJs(unicode) {
     const { charCode, glyphId } = lookupCmap(this.cmap, unicode);
     let fn = this.compiledGlyphs[glyphId],
@@ -798,7 +816,7 @@ class CompiledFont {
       try {
         fn = this.compileGlyph(this.glyphs[glyphId], glyphId);
       } catch (ex) {
-        fn = NOOP; // Avoid attempting to re-compile a corrupt glyph.
+        fn = CompiledFont.NOOP; // Avoid attempting to re-compile a corrupt glyph.
 
         compileEx = ex;
       }
@@ -814,7 +832,7 @@ class CompiledFont {
 
   compileGlyph(code, glyphId) {
     if (!code?.length || code[0] === 14) {
-      return NOOP;
+      return CompiledFont.NOOP;
     }
 
     let fontMatrix = this.fontMatrix;
@@ -834,9 +852,9 @@ class CompiledFont {
     const cmds = new Commands();
     cmds.transform(fontMatrix.slice());
     this.compileGlyphImpl(code, cmds, glyphId);
-    cmds.add("Z");
+    cmds.add(DrawOPS.closePath);
 
-    return cmds.getSVG();
+    return cmds.getPath();
   }
 
   compileGlyphImpl() {

@@ -14,7 +14,6 @@
  */
 
 /** @typedef {import("./event_utils").EventBus} EventBus */
-/** @typedef {import("./interfaces").IPDFLinkService} IPDFLinkService */
 
 import { isValidExplicitDest } from "pdfjs-lib";
 import { parseQueryString } from "./ui_utils.js";
@@ -45,7 +44,6 @@ const LinkTarget = {
 /**
  * Performs navigation functions inside PDF, such as opening specified page,
  * or destination.
- * @implements {IPDFLinkService}
  */
 class PDFLinkService {
   externalLinkEnabled = true;
@@ -87,7 +85,7 @@ class PDFLinkService {
    * @type {number}
    */
   get pagesCount() {
-    return this.pdfDocument ? this.pdfDocument.numPages : 0;
+    return this.pdfDocument?.pagesMapper.pagesNumber || 0;
   }
 
   /**
@@ -192,6 +190,18 @@ class PDFLinkService {
       destArray: explicitDest,
       ignoreDestinationZoom: this._ignoreDestinationZoom,
     });
+
+    const ac = new AbortController();
+    this.eventBus._on(
+      "textlayerrendered",
+      evt => {
+        if (evt.pageNumber === pageNumber) {
+          evt.source.textLayer.div.focus();
+          ac.abort();
+        }
+      },
+      { signal: ac.signal }
+    );
   }
 
   /**
@@ -225,6 +235,22 @@ class PDFLinkService {
     }
 
     this.pdfViewer.scrollPageIntoView({ pageNumber });
+  }
+
+  /**
+   * Scrolls to a specific location in the PDF document.
+   * @param {number} pageNumber - The page number to scroll to.
+   * @param {number} x - The x-coordinate to scroll to in page coordinates.
+   * @param {number} y - The y-coordinate to scroll to in page coordinates.
+   * @param {Object} [options]
+   */
+  goToXY(pageNumber, x, y, options = {}) {
+    this.pdfViewer.scrollPageIntoView({
+      pageNumber,
+      destArray: [null, { name: "XYZ" }, x, y],
+      ignoreDestinationZoom: true,
+      ...options,
+    });
   }
 
   /**
@@ -397,7 +423,7 @@ class PDFLinkService {
       }
       // Support opening of PDF attachments in the Firefox PDF Viewer,
       // which uses a couple of non-standard hash parameters; refer to
-      // `DownloadManager.openOrDownloadData` in the firefoxcom.js file.
+      // `DownloadManager._getOpenDataUrl` in the firefoxcom.js file.
       if (!params.has("filename") || !params.has("filedest")) {
         return;
       }
@@ -489,9 +515,6 @@ class PDFLinkService {
   }
 }
 
-/**
- * @implements {IPDFLinkService}
- */
 class SimpleLinkService extends PDFLinkService {
   setDocument(pdfDocument, baseUrl = null) {}
 }

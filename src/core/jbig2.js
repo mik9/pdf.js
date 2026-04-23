@@ -1165,15 +1165,15 @@ function readSegmentHeader(data, start) {
   let referredToCount = (referredFlags >> 5) & 7;
   const retainBits = [referredFlags & 31];
   let position = start + 6;
-  if (referredFlags === 7) {
+  if (referredToCount === 7) {
     referredToCount = readUint32(data, position - 1) & 0x1fffffff;
     position += 3;
-    let bytes = (referredToCount + 7) >> 3;
+    let bytes = (referredToCount + 8) >> 3;
     retainBits[0] = data[position++];
     while (--bytes > 0) {
       retainBits.push(data[position++]);
     }
-  } else if (referredFlags === 5 || referredFlags === 6) {
+  } else if (referredToCount === 5 || referredToCount === 6) {
     throw new Jbig2Error("invalid referred-to flags");
   }
 
@@ -1677,11 +1677,7 @@ class SimpleSegmentVisitor {
     }
 
     // Combines exported symbols from all referred segments
-    let symbols = this.symbols;
-    if (!symbols) {
-      this.symbols = symbols = {};
-    }
-
+    const symbols = (this.symbols ||= {});
     const inputSymbols = [];
     for (const referredSegment of referredSegments) {
       const referredSymbols = symbols[referredSegment];
@@ -1766,10 +1762,7 @@ class SimpleSegmentVisitor {
   }
 
   onPatternDictionary(dictionary, currentSegment, data, start, end) {
-    let patterns = this.patterns;
-    if (!patterns) {
-      this.patterns = patterns = {};
-    }
+    const patterns = (this.patterns ||= {});
     const decodingContext = new DecodingContext(data, start, end);
     patterns[currentSegment] = decodePatternDictionary(
       dictionary.mmr,
@@ -1811,10 +1804,7 @@ class SimpleSegmentVisitor {
   }
 
   onTables(currentSegment, data, start, end) {
-    let customTables = this.customTables;
-    if (!customTables) {
-      this.customTables = customTables = {};
-    }
+    const customTables = (this.customTables ||= {});
     customTables[currentSegment] = decodeTablesSegment(data, start, end);
   }
 }
@@ -1865,10 +1855,7 @@ class HuffmanTreeNode {
       this.children[bit] = new HuffmanTreeNode(line);
     } else {
       // Create an intermediate node and continue recursively.
-      let node = this.children[bit];
-      if (!node) {
-        this.children[bit] = node = new HuffmanTreeNode(null);
-      }
+      const node = (this.children[bit] ||= new HuffmanTreeNode(null));
       node.buildTree(line, shift - 1);
     }
   }

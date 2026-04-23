@@ -37,19 +37,15 @@ if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
 
   // Limit canvas size to 5 mega-pixels on mobile.
   // Support: Android, iOS
-  (function () {
-    if (isIOS || isAndroid) {
-      compatParams.set("maxCanvasPixels", 5242880);
-    }
-  })();
+  if (isIOS || isAndroid) {
+    compatParams.set("maxCanvasPixels", 5242880);
+  }
 
   // Don't use system fonts on Android (issue 18210).
   // Support: Android
-  (function () {
-    if (isAndroid) {
-      compatParams.set("useSystemFonts", false);
-    }
-  })();
+  if (isAndroid) {
+    compatParams.set("useSystemFonts", false);
+  }
 }
 
 const OptionKind = {
@@ -173,6 +169,14 @@ const defaultOptions = {
     value: 200,
     kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
   },
+  commentLearnMoreUrl: {
+    /** @type {string} */
+    value:
+      typeof PDFJSDev === "undefined" || PDFJSDev.test("MOZCENTRAL")
+        ? "https://support.mozilla.org/%LOCALE%/kb/view-pdf-files-firefox-or-choose-another-viewer#w_add-a-comment-to-a-pdf"
+        : "",
+    kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
+  },
   cursorToolOnLoad: {
     /** @type {number} */
     value: 0,
@@ -218,6 +222,11 @@ const defaultOptions = {
     value: true,
     kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
   },
+  enableComment: {
+    /** @type {boolean} */
+    value: typeof PDFJSDev === "undefined",
+    kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
+  },
   enableDetailCanvas: {
     /** @type {boolean} */
     value: true,
@@ -241,6 +250,16 @@ const defaultOptions = {
     value: true,
     kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
   },
+  enableNewBadge: {
+    /** @type {boolean} */
+    value: typeof PDFJSDev === "undefined" || PDFJSDev.test("MOZCENTRAL"),
+    kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
+  },
+  enableOptimizedPartialRendering: {
+    /** @type {boolean} */
+    value: false,
+    kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
+  },
   enablePermissions: {
     /** @type {boolean} */
     value: false,
@@ -257,6 +276,11 @@ const defaultOptions = {
     kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
   },
   enableSignatureEditor: {
+    /** @type {boolean} */
+    value: typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING"),
+    kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
+  },
+  enableSplitMerge: {
     /** @type {boolean} */
     value: typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING"),
     kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
@@ -281,7 +305,9 @@ const defaultOptions = {
   },
   highlightEditorColors: {
     /** @type {string} */
-    value: "yellow=#FFFF98,green=#53FFBC,blue=#80EBFF,pink=#FFCBE6,red=#FF4F5F",
+    value:
+      "yellow=#FFFF98,green=#53FFBC,blue=#80EBFF,pink=#FFCBE6,red=#FF4F5F," +
+      "yellow_HCM=#FFFFCC,green_HCM=#53FFBC,blue_HCM=#80EBFF,pink_HCM=#F6B8FF,red_HCM=#C50043",
     kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
   },
   historyUpdateUrl: {
@@ -301,6 +327,20 @@ const defaultOptions = {
         ? "resource://pdf.js/web/images/"
         : "./images/",
     kind: OptionKind.VIEWER,
+  },
+  imagesRightClickMinSize: {
+    /** @type {number} */
+    value:
+      typeof PDFJSDev !== "undefined" &&
+      // Firefox mobile does not support right-clicking on images,
+      // see https://bugzilla.mozilla.org/show_bug.cgi?id=2014081.
+      // This option is disabled by default outside of MOZCENTRAL
+      // because it degrades the text selection experience in Chrome
+      // and Safari.
+      PDFJSDev.test("MOZCENTRAL && !GECKOVIEW")
+        ? 16
+        : -1,
+    kind: OptionKind.VIEWER + OptionKind.PREFERENCE,
   },
   maxCanvasPixels: {
     /** @type {number} */
@@ -417,8 +457,13 @@ const defaultOptions = {
   },
   enableHWA: {
     /** @type {boolean} */
-    value: typeof PDFJSDev !== "undefined" && !PDFJSDev.test("MOZCENTRAL"),
-    kind: OptionKind.API + OptionKind.VIEWER + OptionKind.PREFERENCE,
+    value: true,
+    kind: OptionKind.API + OptionKind.PREFERENCE,
+  },
+  enableWebGPU: {
+    /** @type {boolean} */
+    value: true,
+    kind: OptionKind.API + OptionKind.PREFERENCE,
   },
   enableXfa: {
     /** @type {boolean} */
@@ -557,7 +602,7 @@ if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
   };
 }
 
-if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING || LIB")) {
+if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
   // Ensure that the `defaultOptions` are correctly specified.
   for (const name in defaultOptions) {
     const { value, kind, type } = defaultOptions[name];
