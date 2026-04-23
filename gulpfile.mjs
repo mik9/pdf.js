@@ -60,6 +60,7 @@ const GENERIC_DIR = BUILD_DIR + "generic/";
 const GENERIC_LEGACY_DIR = BUILD_DIR + "generic-legacy/";
 const COMPONENTS_DIR = BUILD_DIR + "components/";
 const COMPONENTS_LEGACY_DIR = BUILD_DIR + "components-legacy/";
+const COMPONENTS_LEGACY_MINIFIED_DIR = BUILD_DIR + "components-legacy-minified/";
 const IMAGE_DECODERS_DIR = BUILD_DIR + "image_decoders/";
 const IMAGE_DECODERS_LEGACY_DIR = BUILD_DIR + "image_decoders-legacy/";
 const DEFAULT_PREFERENCES_DIR = BUILD_DIR + "default_preferences/";
@@ -559,7 +560,7 @@ function createGVWebBundle(defines, options) {
 
 function createComponentsBundle(defines) {
   const componentsFileConfig = createWebpackConfig(defines, {
-    filename: "pdf_viewer.mjs",
+    filename: defines.MINIFIED ? "pdf_viewer.min.mjs" : "pdf_viewer.mjs",
     library: {
       type: "module",
     },
@@ -1177,6 +1178,22 @@ gulp.task(
 );
 
 gulp.task(
+  "components-legacy-minified",
+  gulp.series(createBuildNumber, function createComponentsLegacy() {
+    console.log("\n### Creating generic (legacy) components");
+    const defines = {
+      ...DEFINES,
+      COMPONENTS: true,
+      GENERIC: true,
+      SKIP_BABEL: false,
+      MINIFIED: true,
+    };
+
+    return buildComponents(defines, COMPONENTS_LEGACY_MINIFIED_DIR);
+  })
+);
+
+gulp.task(
   "image_decoders",
   gulp.series(createBuildNumber, function createImageDecoders() {
     console.log("\n### Creating image decoders");
@@ -1209,7 +1226,6 @@ function buildMinified(defines, dir) {
   fs.rmSync(dir, { recursive: true, force: true });
 
   return ordered([
-    createComponentsBundle(defines).pipe(gulp.dest(dir)),
     createMainBundle(defines).pipe(gulp.dest(dir + "build")),
     createWorkerBundle(defines).pipe(gulp.dest(dir + "build")),
     createSandboxBundle(defines).pipe(gulp.dest(dir + "build")),
